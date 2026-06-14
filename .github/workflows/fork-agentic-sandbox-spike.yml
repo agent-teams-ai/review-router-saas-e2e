@@ -1,0 +1,171 @@
+name: Fork Agentic Sandbox Spike
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  canary:
+    name: canary
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'rr-fork-sandbox-spike-')
+    steps:
+      - name: Checkout pull request head as passive data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-workspace
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run sandbox canary
+        id: canary
+        shell: bash
+        env:
+          HOST_CANARY: RR_CANARY_HOST_SECRET_${{ github.run_id }}_${{ github.run_attempt }}
+          AUTH_CANARY: RR_CANARY_AUTH_FILE_${{ github.run_id }}_${{ github.run_attempt }}
+          WORKSPACE_CANARY: RR_CANARY_WORKSPACE_DOTENV_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.codex" "$HOME/.claude" sandbox-out safe-workspace
+          printf '{"token":"%s"}\n' "$AUTH_CANARY" > "$HOME/.codex/auth.json"
+          printf '{"token":"%s"}\n' "$AUTH_CANARY" > "$HOME/.claude/settings.json"
+          printf 'SECRET=%s\n' "$WORKSPACE_CANARY" > pr-workspace/.env
+
+          tar \
+            --exclude='./.git' \
+            --exclude='./.env' \
+            --exclude='./.codex' \
+            --exclude='./.claude' \
+            -C pr-workspace \
+            -cf - . | tar -C safe-workspace -xf -
+
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 128 \
+            --memory 512m \
+            --cpus 1 \
+            --user 1000:1000 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            -e HOME=/tmp/home \
+            -v "$PWD/safe-workspace:/workspace:ro" \
+            -v "$PWD/sandbox-out:/out:rw" \
+            ubuntu:24.04 \
+            bash -lc '
+              set -euo pipefail
+              mkdir -p "$HOME"
+              cd /workspace
+
+              context_ok=false
+              if [ -f review-target.js ] && [ -f src/shared-helper.js ] &&
+                 grep -q "sharedHelper" review-target.js &&
+                 grep -q "helper-value-from-related-file" src/shared-helper.js; then
+                context_ok=true
+              fi
+
+              network_blocked=true
+              timeout 5 bash -lc "cat < /dev/tcp/example.com/80" >/tmp/network.out 2>/tmp/network.err && network_blocked=false || true
+
+              {
+                echo "ENV_BEGIN"
+                env || true
+                echo "HOME_BEGIN"
+                find "$HOME" -maxdepth 4 -type f -print -exec cat {} \; 2>/dev/null || true
+                echo "AUTH_PROBES_BEGIN"
+                cat "$HOME/.codex/auth.json" 2>/dev/null || true
+                cat "$HOME/.claude/settings.json" 2>/dev/null || true
+                cat /root/.codex/auth.json 2>/dev/null || true
+                cat /root/.claude/settings.json 2>/dev/null || true
+                echo "WORKSPACE_PROBES_BEGIN"
+                cat /workspace/.env 2>/dev/null || true
+                grep -R "RR_CANARY" /workspace -n 2>/dev/null || true
+                echo "PROC_PROBES_BEGIN"
+                tr "\0" "\n" < /proc/1/environ 2>/dev/null || true
+              } > /out/probe.txt
+
+              {
+                echo "{"
+                echo "  \"context_ok\": $context_ok,"
+                echo "  \"network_blocked\": $network_blocked,"
+                echo "  \"workspace_root\": \"/workspace\""
+                echo "}"
+              } > /out/result.json
+            '
+
+          if grep -R -F "$HOST_CANARY" sandbox-out safe-workspace; then
+            echo "::error::host canary leaked into sandbox-visible output"
+            exit 1
+          fi
+          if grep -R -F "$AUTH_CANARY" sandbox-out safe-workspace; then
+            echo "::error::auth file canary leaked into sandbox-visible output"
+            exit 1
+          fi
+          if grep -R -F "$WORKSPACE_CANARY" sandbox-out safe-workspace; then
+            echo "::error::workspace .env canary leaked into sandbox-visible output"
+            exit 1
+          fi
+          if ! grep -q '"context_ok": true' sandbox-out/result.json; then
+            echo "::error::sandbox could not read expected repository context"
+            cat sandbox-out/result.json
+            exit 1
+          fi
+          if ! grep -q '"network_blocked": true' sandbox-out/result.json; then
+            echo "::error::sandbox network probe was not blocked"
+            cat sandbox-out/result.json
+            exit 1
+          fi
+
+          {
+            echo "result<<EOF"
+            cat sandbox-out/result.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post trusted inline review
+        uses: actions/github-script@v7
+        env:
+          CANARY_RESULT: ${{ steps.canary.outputs.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const expectedHead = context.payload.pull_request.head.sha;
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number,
+            });
+            if (pr.head.sha !== expectedHead) {
+              core.setFailed(`stale head: expected ${expectedHead}, got ${pr.head.sha}`);
+              return;
+            }
+
+            await github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number,
+              commit_id: expectedHead,
+              event: 'COMMENT',
+              body: `Fork sandbox canary passed.\n\n${process.env.CANARY_RESULT}`,
+              comments: [
+                {
+                  path: 'review-target.js',
+                  line: 2,
+                  side: 'RIGHT',
+                  body: 'Fork sandbox inline comment canary: trusted poster can comment on the fork PR head after sandbox validation.',
+                },
+              ],
+            });
