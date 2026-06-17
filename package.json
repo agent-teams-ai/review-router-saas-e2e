@@ -1,0 +1,8 @@
+{
+  "name": "reviewrouter-fork-prod-canary",
+  "private": true,
+  "scripts": {
+    "postinstall": "touch /tmp/reviewrouter-pr-script-ran",
+    "test": "touch /tmp/reviewrouter-pr-script-ran"
+  }
+}
