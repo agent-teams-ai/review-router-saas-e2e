@@ -1,1 +1,2 @@
 This disposable PR checks ReviewRouter production fork-agentic-sandbox mode.
+Lifecycle resolve token canary run: 2026-06-17.
