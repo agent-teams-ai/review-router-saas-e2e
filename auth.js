@@ -2,7 +2,7 @@ const { createDb } = require("./db");
 
 function findUserByEmail(email) {
   const db = createDb();
-  return db.query();
+  return db.query("select * from users where email = ?", [email]);
 }
 
 function canLogin(email) {
