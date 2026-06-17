@@ -119,6 +119,22 @@ jobs:
             '',
           ].join('\n');
           writeFileSync(join(actionRoot, 'dist/index.js'), fakeRuntime);
+
+          const actionDistPath = join(actionRoot, 'action-dist/index.cjs');
+          const actionDist = readFileSync(actionDistPath, 'utf8');
+          const publicKeyStart = 'async function fetchGitHubRepositoryPublicKey(input) {';
+          const publicKeyEnd = '\nasync function fetchWithRetry(input) {';
+          const start = actionDist.indexOf(publicKeyStart);
+          const end = actionDist.indexOf(publicKeyEnd, start);
+          if (start < 0 || end < 0) {
+            throw new Error('fetchGitHubRepositoryPublicKey patch target missing');
+          }
+          const fakePublicKey = [
+            'async function fetchGitHubRepositoryPublicKey(input) {',
+            "  return { key: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=', key_id: 'fake-key-id' };",
+            '}',
+          ].join('\n');
+          writeFileSync(actionDistPath, actionDist.slice(0, start) + fakePublicKey + actionDist.slice(end));
           NODE
 
       - name: Checkout fork pull request head safely
