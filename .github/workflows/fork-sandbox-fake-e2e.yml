@@ -1,0 +1,243 @@
+name: Fork Sandbox Fake Control Plane E2E
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  fork-sandbox-fake-e2e:
+    name: fork sandbox fake e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name != github.repository }}
+    steps:
+      - name: Checkout action runtime
+        uses: actions/checkout@v6
+        with:
+          repository: 777genius/review-router
+          ref: main
+          path: review-router-action
+          persist-credentials: false
+
+      - name: Install fake runtime tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fake-bin
+          cat > fake-bin/claude <<'SCRIPT'
+          #!/usr/bin/env node
+          process.stdout.write('claude 1.0.0\n');
+          SCRIPT
+          chmod +x fake-bin/claude
+          echo "$PWD/fake-bin" >> "$GITHUB_PATH"
+
+      - name: Patch local action with fake Codex and fake runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { mkdirSync, writeFileSync, chmodSync, statSync, rmSync, readFileSync } = require('node:fs');
+          const { spawnSync } = require('node:child_process');
+          const { dirname, join } = require('node:path');
+
+          const actionRoot = join(process.cwd(), 'review-router-action');
+          const staging = join(process.cwd(), 'fake-codex-package');
+          const binaryRelative = 'package/vendor/x86_64-unknown-linux-musl/bin/codex';
+          const binaryPath = join(staging, binaryRelative);
+          mkdirSync(dirname(binaryPath), { recursive: true });
+          writeFileSync(binaryPath, [
+            '#!/usr/bin/env node',
+            "const { readFileSync, writeFileSync } = require('node:fs');",
+            "const { join } = require('node:path');",
+            "const authPath = join(process.env.CODEX_HOME, 'auth.json');",
+            "readFileSync(authPath, 'utf8');",
+            "writeFileSync(authPath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { refresh_token: 'refreshed-refresh-token', access_token: 'refreshed-access-token' } }));",
+            "process.stdout.write('OK\\n');",
+            '',
+          ].join('\n'));
+          chmodSync(binaryPath, 0o755);
+
+          const bundleRoot = join(actionRoot, 'action-dist/codex/linux-x64');
+          mkdirSync(bundleRoot, { recursive: true });
+          const archivePath = join(bundleRoot, 'codex-linux-x64.tgz');
+          rmSync(archivePath, { force: true });
+          const tar = spawnSync('tar', ['-czf', archivePath, '-C', staging, 'package'], { stdio: 'inherit' });
+          if (tar.status !== 0) process.exit(tar.status || 1);
+
+          const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
+          const manifest = {
+            protocolVersion: 1,
+            packageName: '@openai/codex',
+            version: '0.135.0',
+            platform: 'linux-x64',
+            archive: 'codex-linux-x64.tgz',
+            archiveSize: statSync(archivePath).size,
+            archiveSha256: sha256(archivePath),
+            binaryPathInArchive: binaryRelative,
+            binary: 'codex',
+            size: statSync(binaryPath).size,
+            sha256: sha256(binaryPath),
+          };
+          writeFileSync(join(bundleRoot, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+
+          const fakeRuntime = [
+            '#!/usr/bin/env node',
+            "const { existsSync, readFileSync } = require('node:fs');",
+            "const { join, resolve } = require('node:path');",
+            "function fail(message) { console.error('E2E_FAIL:' + message); process.exit(1); }",
+            "const cwd = resolve(process.cwd());",
+            "const workspace = resolve(process.env.GITHUB_WORKSPACE || '');",
+            "if (workspace !== cwd) fail('GITHUB_WORKSPACE must equal safe workspace');",
+            "if (!existsSync(join(cwd, 'fork-change.txt'))) fail('safe workspace file missing');",
+            "if (process.env.REVIEWROUTER_FORK_AGENTIC_SANDBOX !== 'true') fail('fork flag missing');",
+            "if (process.env.CLAUDE_AGENTIC_CONTEXT !== 'true') fail('claude agentic context missing');",
+            "if (process.env.REVIEW_PROVIDERS !== 'codex/gpt-5.5,claude/sonnet,openrouter/openai/gpt-5.3-codex') fail('unexpected providers ' + process.env.REVIEW_PROVIDERS);",
+            "if (process.env.PROVIDER_LIMIT !== '3' || process.env.PROVIDER_MAX_PARALLEL !== '3' || process.env.INLINE_MIN_AGREEMENT !== '3') fail('limits were not clamped');",
+            "if (process.env.REQUIRED_HEALTHY_PROVIDERS !== 'claude/sonnet,openrouter/openai/gpt-5.3-codex') fail('required providers not filtered');",
+            "if (process.env.SYNTHESIS_MODEL !== 'openrouter/openai/gpt-5.3-codex') fail('synthesis model not preserved');",
+            "if (process.env.CLAUDE_CODE_OAUTH_TOKEN !== 'sk-ant-oat01-fake-claude-token') fail('claude token missing');",
+            "if (process.env.OPENROUTER_API_KEY !== 'sk-or-fake-openrouter-token') fail('openrouter key missing');",
+            "if (!process.env.GITHUB_TOKEN) fail('comment token missing');",
+            "if (process.env.OPENAI_API_KEY) fail('OPENAI_API_KEY leaked');",
+            "if (process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) fail('OIDC token leaked');",
+            "if (process.env.INPUT_AUTH_JSON || process.env['INPUT_AUTH-JSON']) fail('auth input leaked');",
+            "if (process.env.OPENROUTER_MODEL || process.env.EXTRA_RUNTIME_FLAG) fail('uncertified env leaked');",
+            "const config = readFileSync(join(process.env.CODEX_HOME, 'config.toml'), 'utf8');",
+            "if (!config.includes('model_provider = \\\"reviewrouter_proxy\\\"')) fail('proxy config missing');",
+            "if (!config.includes('sandbox_mode = \\\"read-only\\\"')) fail('read-only config missing');",
+            "if (config.includes('refreshed-access-token')) fail('token leaked into config');",
+            "if (existsSync(join(process.env.CODEX_HOME, 'auth.json'))) fail('auth json should be removed before runtime');",
+            "console.log('FORK_SANDBOX_FAKE_E2E_PASS');",
+            '',
+          ].join('\n');
+          writeFileSync(join(actionRoot, 'dist/index.js'), fakeRuntime);
+          NODE
+
+      - name: Checkout fork pull request head safely
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: safe-workspace
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify fork sandbox checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git -C safe-workspace config --local --get-regexp 'http\..*\.extraheader|credential\.helper|url\..*\.insteadOf' >/tmp/reviewrouter-unsafe-git-config 2>/dev/null; then
+            cat /tmp/reviewrouter-unsafe-git-config
+            echo "::error::ReviewRouter fork sandbox checkout persisted credentials."
+            exit 1
+          fi
+
+      - name: Start fake ReviewRouter control plane
+        id: fake_api
+        shell: bash
+        env:
+          COMMENT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > fake-control-plane.mjs <<'NODE'
+          import http from 'node:http';
+          import { appendFileSync } from 'node:fs';
+          const server = http.createServer((req, res) => {
+            let body = '';
+            req.on('data', chunk => { body += chunk; });
+            req.on('end', () => {
+              res.setHeader('content-type', 'application/json');
+              if (req.url?.endsWith('/api/action/v1/codex-oauth/prelease')) {
+                res.end(JSON.stringify({ leaseId: 'lease_fake', generationHashSalt: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY' }));
+                return;
+              }
+              if (req.url?.endsWith('/api/action/v1/codex-oauth/finalize')) {
+                res.end(JSON.stringify({
+                  status: 'finalized',
+                  nextGeneration: 2,
+                  repositoryOwner: process.env.GITHUB_REPOSITORY_OWNER,
+                  repositoryName: process.env.GITHUB_REPOSITORY.split('/')[1],
+                  publicKeyReadToken: process.env.COMMENT_TOKEN,
+                  runtimeConfigVersion: 777,
+                  runtimeEnv: {
+                    REVIEW_AUTH_MODE: 'codex-oauth-rotating',
+                    REVIEW_PROVIDERS: 'gemini/gemini-2.0,codex/gpt-5.5,claude/sonnet,openrouter/openai/gpt-5.3-codex,opencode/qwen',
+                    REQUIRED_HEALTHY_PROVIDERS: 'gemini/gemini-2.0,claude/sonnet,openrouter/openai/gpt-5.3-codex',
+                    SYNTHESIS_MODEL: 'openrouter/openai/gpt-5.3-codex',
+                    PROVIDER_LIMIT: '9',
+                    PROVIDER_MAX_PARALLEL: '8',
+                    INLINE_MIN_AGREEMENT: '7',
+                    CODEX_MODEL: 'gpt-5.5',
+                    CLAUDE_MODEL: 'sonnet',
+                    OPENROUTER_MODEL: 'openai/gpt-5.3-codex',
+                    EXTRA_RUNTIME_FLAG: 'must-not-pass'
+                  }
+                }));
+                return;
+              }
+              if (req.url?.endsWith('/api/action/v1/codex-oauth/writeback-preflight')) {
+                res.end(JSON.stringify({ protocolVersion: 1, status: 'ready' }));
+                return;
+              }
+              if (req.url?.endsWith('/api/action/v1/codex-oauth/writeback')) {
+                res.end(JSON.stringify({ protocolVersion: 1, status: 'accepted' }));
+                return;
+              }
+              if (req.url?.endsWith('/api/action/v1/codex-oauth/comment-token')) {
+                res.end(JSON.stringify({ token: process.env.COMMENT_TOKEN, repository: process.env.GITHUB_REPOSITORY }));
+                return;
+              }
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: 'unexpected', url: req.url, body }));
+            });
+          });
+          server.listen(0, '127.0.0.1', () => {
+            const { port } = server.address();
+            console.log(`FAKE_API_PORT=${port}`);
+            console.log(`api_url=http://127.0.0.1:${port}`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `api_url=http://127.0.0.1:${port}\n`);
+          });
+          NODE
+          node fake-control-plane.mjs > fake-control-plane.log 2>&1 &
+          echo $! > fake-control-plane.pid
+          for i in {1..50}; do
+            if grep -q '^api_url=' fake-control-plane.log; then
+              cat fake-control-plane.log
+              break
+            fi
+            sleep 0.2
+          done
+          grep '^api_url=' fake-control-plane.log
+
+      - name: Run ReviewRouter fork sandbox action
+        uses: ./review-router-action
+        with:
+          mode: fork-agentic-sandbox
+          api-url: ${{ steps.fake_api.outputs.api_url }}
+          provider-instance-id: fake-provider-instance
+          workflow-schema-version: '1'
+          auth-json: '{"auth_mode":"chatgpt","tokens":{"refresh_token":"initial-refresh-token","access_token":"initial-access-token"}}'
+          claude-code-oauth-token: sk-ant-oat01-fake-claude-token
+          openrouter-api-key: sk-or-fake-openrouter-token
+        env:
+          REVIEW_ROUTER_PR_WORKSPACE: ${{ github.workspace }}/safe-workspace
+          REVIEW_ROUTER_USE_SUBSCRIPTION_RUNTIME_CODEX: '0'
+          OPENAI_API_KEY: must-not-leak
+          OPENROUTER_API_KEY: inherited-must-not-leak
+          CLAUDE_CODE_OAUTH_TOKEN: inherited-must-not-leak
+
+      - name: Stop fake control plane
+        if: always()
+        shell: bash
+        run: |
+          if [ -f fake-control-plane.pid ]; then
+            kill "$(cat fake-control-plane.pid)" || true
+          fi
